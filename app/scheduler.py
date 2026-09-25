@@ -15,6 +15,13 @@ A tenant's *balance* (deficit counter) is measured in the same unit.
 
 WDRR per batch
 ==============
+A batch takes one consistent snapshot inside its transaction and then only
+walks in-memory state: every tenant's QUEUED jobs are read once in FIFO
+order (``queued_at, id``), together with every job's dependency state and
+the per-tenant RUNNING GPU totals. Each tenant owns a head-of-line *cursor*
+into its FIFO list that advances ONLY when its head job is dispatched; the
+round loop therefore never re-queries a queue head or a prerequisite.
+
 1. Each active tenant (one with QUEUED jobs, tenant id order) receives
    ``base_quantum * weight`` GPU-minutes of credit every DRR round.
 2. Visiting tenants in fixed order, the head-of-line job is dispatched when
@@ -22,6 +29,17 @@ WDRR per batch
    concurrent-GPU cap (optional ``max_gpus``) still has room.
 3. A full round in which nothing is dispatched ends the batch: blocked jobs
    keep their credit, and a later batch (after completions or aging) retries.
+
+When a cursor advances (a dispatch happened), the NEW head is re-evaluated
+from the same snapshot: dependency readiness, the peak maintenance
+reservation over its predicted run, the tenant's concurrent-GPU cap and the
+rolling 24-hour budget are all judged afresh for that row. Dependency
+readiness cannot change *within* a batch — a queued job's prerequisites are
+not completed or cancelled here; jobs only leave QUEUED by being selected —
+so the readiness map read once at batch start stays valid for every round
+and every revealed head. Committed batch and preview run byte-identical
+snapshot/loop code; the only difference is COMMIT versus ROLLBACK, so the
+trailing QUANTUM grants that never led to a dispatch are discarded in both.
 
 Per-tenant GPU caps
 ===================
@@ -436,6 +454,25 @@ def _head_ready_since(
 ) -> datetime:
     """Instant the (dependency-ready) head job's wait became scheduler-facing.
 
+    See :func:`_ready_since` for the full contract; this wrapper derives the
+    prerequisite-completion map from the database for a single job (used by
+    the dependency-revision path). The batch path loads the same map for
+    every queued job in one read and calls :func:`_ready_since` directly, so
+    the readiness derivation is one code path either way.
+    """
+    row = conn.execute(
+        """SELECT MAX(j.completed_at) AS done
+             FROM job_dependencies d
+             JOIN jobs j ON j.id = d.depends_on
+            WHERE d.job_id = ?""",
+        (head["id"],),
+    ).fetchone()
+    return _ready_since(head, row["done"])
+
+
+def _ready_since(head: sqlite3.Row, prereq_done_at: str | None) -> datetime:
+    """Instant the (dependency-ready) head job's wait became scheduler-facing.
+
     Waiting on prerequisites is not scheduler starvation, so aging credit
     must not reach back past the moment the head job truly became
     schedulable. When the job carries a ``ready_since`` stamp — written by
@@ -443,9 +480,9 @@ def _head_ready_since(
     current ready state — that stamp IS the readiness moment. Otherwise it
     is derived from the job's arrival (``queued_at``) and its
     prerequisites: with several prerequisites the LAST completion releases
-    the job, so the newest ``completed_at`` governs. (A timestamp later
-    than the batch reference instant simply clamps the computed wait to
-    zero at the call site.)
+    the job, so the newest ``completed_at`` (``prereq_done_at``) governs.
+    (A timestamp later than the batch reference instant simply clamps the
+    computed wait to zero at the call site.)
     """
     queued = _as_utc(_parse_iso(head["queued_at"]))
     revised = head["ready_since"]
@@ -454,15 +491,8 @@ def _head_ready_since(
         # ready state; never earlier than the job's own arrival.
         return max(_as_utc(_parse_iso(revised)), queued)
     ready = queued
-    row = conn.execute(
-        """SELECT MAX(j.completed_at) AS done
-             FROM job_dependencies d
-             JOIN jobs j ON j.id = d.depends_on
-            WHERE d.job_id = ?""",
-        (head["id"],),
-    ).fetchone()
-    if row["done"] is not None:
-        done = _as_utc(_parse_iso(row["done"]))
+    if prereq_done_at is not None:
+        done = _as_utc(_parse_iso(prereq_done_at))
         if done > ready:
             ready = done
     return ready
@@ -2028,26 +2058,69 @@ def _batch_tx_body(
         )
         return _batch_result(conn, batch_id, settings, preview)
 
-    # Dependency readiness is recomputed from the *current* head of each
-    # queue: only a COMPLETED prerequisite releases a job, and a tenant's
-    # next head (revealed after a dispatch) may itself be blocked. A
-    # tenant whose head-of-line job is blocked neither accrues aging nor
-    # spends quantum: waiting on another job is not scheduler starvation,
-    # and blocked batches must not hand out spendable credit.
+    # ------------------------------------------------------------------
+    # One-shot batch snapshot: every QUEUED job in FIFO order, each one's
+    # dependency state, and the per-tenant RUNNING GPU totals are read in
+    # this single transaction snapshot and then held in memory for the
+    # whole batch. Nothing inside a batch can change a head job's
+    # dependencies or prerequisites' status (jobs only leave QUEUED by
+    # being dispatched here), so the readiness result computed once at
+    # batch start stays valid for every round; a tenant's NEW head
+    # revealed by a dispatch is one of the FIFO rows already loaded, so
+    # its dependency state comes from the same snapshot with no re-query.
+    # A per-tenant cursor (``cursor[tid]``) walks that tenant's FIFO list
+    # and advances ONLY when its head job is dispatched: the round loop
+    # never re-reads the queue head or its prerequisites.
+    # ------------------------------------------------------------------
+    queued_rows = conn.execute(
+        """SELECT * FROM jobs
+            WHERE status = ?
+            ORDER BY tenant_id, queued_at, id""",
+        (QUEUED,),
+    ).fetchall()
+    queues: dict[str, list[sqlite3.Row]] = {}
+    for row in queued_rows:
+        queues.setdefault(row["tenant_id"], []).append(row)
+    active_ids = [t["tenant_id"] for t in active]
+
+    # Dependency state for every queued job, loaded in one read. ``unmet``
+    # maps a queued job to the ids of prerequisites that are not COMPLETED
+    # (an empty set means ready); ``done_at`` caches the newest
+    # prerequisite completion per job for readiness-aware aging.
+    dep_rows = conn.execute(
+        """SELECT d.job_id AS job_id, p.id AS prereq_id, p.status AS status,
+                  p.completed_at AS completed_at
+             FROM job_dependencies d
+             JOIN jobs p ON p.id = d.depends_on
+             JOIN jobs j ON j.id = d.job_id
+            WHERE j.status = ?
+            ORDER BY d.job_id, p.id""",
+        (QUEUED,),
+    ).fetchall()
+    unmet: dict[str, set[str]] = {}
+    done_at: dict[str, str | None] = {}
+    for r in dep_rows:
+        done_at.setdefault(r["job_id"], None)
+        if r["completed_at"] is not None and (
+            done_at[r["job_id"]] is None
+            or r["completed_at"] > done_at[r["job_id"]]
+        ):
+            done_at[r["job_id"]] = r["completed_at"]
+        if r["status"] != COMPLETED:
+            unmet.setdefault(r["job_id"], set()).add(r["prereq_id"])
+
     def head_of(tenant_id: str):
-        return conn.execute(
-            """SELECT * FROM jobs
-                WHERE tenant_id = ? AND status = ?
-                ORDER BY queued_at, id LIMIT 1""",
-            (tenant_id, QUEUED),
-        ).fetchone()
+        """Current head-of-line row from the in-memory FIFO snapshot, or
+        None once this tenant's queue has been drained by dispatches."""
+        q = queues[tenant_id]
+        pos = cursor[tenant_id]
+        return q[pos] if pos < len(q) else None
 
     def head_ready(head) -> bool:
-        return head is not None and not _unmet_prerequisites(
-            conn, head["id"]
-        )
+        return head is not None and not unmet.get(head["id"], ())
 
-    active_ids = [t["tenant_id"] for t in active]
+    # Cursor into each tenant's FIFO snapshot; advanced only on dispatch.
+    cursor: dict[str, int] = {tid: 0 for tid in active_ids}
     ready_at_start = {
         tid for tid in active_ids if head_ready(head_of(tid))
     }
@@ -2058,6 +2131,10 @@ def _batch_tx_body(
     # exceed its cap.
     caps: dict[str, int | None] = {
         t["tenant_id"]: t["max_gpus"] for t in active
+    }
+    # Tenant weights, held from the snapshot for the QUANTUM grant.
+    weights: dict[str, float] = {
+        t["tenant_id"]: t["weight"] for t in active
     }
 
     # Rolling 24h GPU-minute budgets (NULL = unlimited). ``budget_spent`` is
@@ -2072,19 +2149,17 @@ def _batch_tx_body(
     }
     budget_spent: dict[str, int] = _budget_spent_map(conn, now_dt)
     selected_cost: dict[str, int] = {}
-    tenant_running: dict[str, int] = {}
 
-    def running_gpus(tenant_id: str) -> int:
-        """GPUs currently held by the tenant's RUNNING jobs."""
-        row = conn.execute(
-            "SELECT COALESCE(SUM(gpus), 0) AS n FROM jobs "
-            "WHERE tenant_id = ? AND status = ?",
-            (tenant_id, RUNNING),
-        ).fetchone()
-        return int(row["n"])
-
-    for tid in active_ids:
-        tenant_running[tid] = running_gpus(tid)
+    # GPUs currently held by each tenant's RUNNING jobs, summed in one read.
+    # It is mutated in memory only when this batch dispatches a job.
+    tenant_running: dict[str, int] = {tid: 0 for tid in active_ids}
+    for r in conn.execute(
+        """SELECT tenant_id, COALESCE(SUM(gpus), 0) AS n
+             FROM jobs WHERE status = ? GROUP BY tenant_id""",
+        (RUNNING,),
+    ).fetchall():
+        if r["tenant_id"] in tenant_running:
+            tenant_running[r["tenant_id"]] = int(r["n"])
 
     def head_reservation(head) -> int:
         """Peak combined maintenance reservation overlapping the head job's
@@ -2143,14 +2218,14 @@ def _batch_tx_body(
                 (now_str, now_str, t["tenant_id"]),
             )
             continue
-        oldest = conn.execute(
-            "SELECT MIN(queued_at) AS ts FROM jobs "
-            "WHERE tenant_id = ? AND status = ?",
-            (t["tenant_id"], QUEUED),
-        ).fetchone()["ts"]
+        # Oldest queued job and the head's readiness instant both come from
+        # the one-shot snapshot above (queues are FIFO, so the first row is
+        # the oldest as well as the head).
+        oldest = queues[t["tenant_id"]][0]["queued_at"]
         base = t["aging_settled_at"] or oldest
         base_dt = _as_utc(_parse_iso(base))
-        ready_dt = _head_ready_since(conn, head_of(t["tenant_id"]))
+        head = head_of(t["tenant_id"])
+        ready_dt = _ready_since(head, done_at.get(head["id"]))
         if ready_dt > base_dt:
             base_dt = ready_dt
         waited_min = (
@@ -2245,23 +2320,19 @@ def _batch_tx_body(
                 # (free GPUs consumed, or the tenant used its cap headroom).
                 continue
 
-            weight = conn.execute(
-                "SELECT weight FROM tenants WHERE id = ?", (tenant_id,)
-            ).fetchone()["weight"]
+            weight = weights[tenant_id]
             quantum = settings.base_quantum_gpu_min * float(weight)
-            _credit(
+            bal = _credit(
                 conn, tenant_id, quantum, "QUANTUM", now_str,
                 batch_id=batch_id, detail=f"round {rounds}",
             )
 
-            bal = conn.execute(
-                "SELECT deficit FROM tenants WHERE id = ?", (tenant_id,)
-            ).fetchone()["deficit"]
             cost = head["cost_gpu_min"]
 
             if bal + _EPS < cost:
                 continue  # keep accruing in later rounds
-            # Capacity, maintenance and cap invariants: never crossed.
+            # Capacity, maintenance, cap and budget invariants: rechecked
+            # for this (possibly newly revealed) head before dispatch.
             if not tenant_can_fit(tenant_id, head, head["gpus"], free):
                 continue
 
@@ -2289,6 +2360,11 @@ def _batch_tx_body(
                 selected_cost.get(tenant_id, 0)
                 + int(head["gpus"]) * int(head["duration_min"])
             )
+            # Advance this tenant's FIFO cursor ONLY after its head was
+            # dispatched: the next round's head/reservation/dependency,
+            # cap and budget decisions all run against the new head row
+            # from the same snapshot.
+            cursor[tenant_id] += 1
             dispatched_this_round = True
 
         if dispatched_this_round:
@@ -2307,9 +2383,12 @@ def _batch_tx_body(
     rollback_uncommitted()
 
     # Close aging windows for tenants whose queue drained; others keep
-    # accruing wait time from this batch's reference instant.
+    # accruing wait time from this batch's reference instant. Drained is
+    # decided from the cursor against the same in-memory FIFO snapshot:
+    # every row before the cursor was dispatched, so a cursor at the end
+    # means no QUEUED job remains for that tenant.
     for tenant_id in active_ids:
-        if _has_queued(conn, tenant_id):
+        if cursor[tenant_id] < len(queues[tenant_id]):
             conn.execute(
                 "UPDATE tenants SET aging_settled_at = ? WHERE id = ?",
                 (now_str, tenant_id),
