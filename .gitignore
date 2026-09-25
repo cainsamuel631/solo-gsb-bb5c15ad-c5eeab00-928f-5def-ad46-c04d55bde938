@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+data/
+*.db
+*.db-wal
+*.db-shm
+
+# Locally installed Python deps (dev environment bootstrap)
+.pydeps/

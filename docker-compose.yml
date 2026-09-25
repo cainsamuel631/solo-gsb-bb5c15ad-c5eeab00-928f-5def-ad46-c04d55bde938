@@ -1,0 +1,28 @@
+services:
+  scheduler:
+    build: .
+    image: gpu-fair-queue:latest
+    container_name: gpu-fair-queue
+    ports:
+      - "8000:8000"
+    environment:
+      # Total physical GPUs in the cluster.
+      CLUSTER_GPUS: "8"
+      # DRR quantum per unit of weight per round, in GPU-minutes.
+      BASE_QUANTUM_GPU_MIN: "60"
+      # Aging credit (GPU-minutes) granted per minute of head-of-line wait.
+      AGING_RATE_GPU_MIN_PER_MIN: "1"
+      # Optional per-batch aging cap; unset/empty disables the cap.
+      AGING_CAP_GPU_MIN: ""
+      DB_PATH: /data/scheduler.db
+    volumes:
+      - scheduler-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health').status==200 else 1)"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  scheduler-data:
